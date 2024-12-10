@@ -1,0 +1,3 @@
+Total heap size: 1048576
+Free space: 1048552
+Fragmented blocks: 1

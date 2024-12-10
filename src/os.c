@@ -3,8 +3,6 @@
 #include "sched.h"
 #include "loader.h"
 #include "mm.h"
-
-
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
@@ -20,34 +18,115 @@ int process_counter = 0;
 static int memramsz;
 static int memswpsz[PAGING_MAX_MMSWP];
 
-struct mmpaging_ld_args
-{
-	/* A dispatched argument struct to compact many-fields passing to loader */
-	struct memphy_struct *mram;
-	struct memphy_struct **mswp;
-	struct memphy_struct *active_mswp;
-	struct timer_id_t *timer_id;
+struct mmpaging_ld_args {
+    struct memphy_struct *mram;
+    struct memphy_struct **mswp;
+    struct memphy_struct *active_mswp;
+    struct timer_id_t *timer_id;
 };
 #endif
 
-static struct ld_args
-{
-	char **path;
-	unsigned long *start_time;
+static struct ld_args {
+    char **path;
+    unsigned long *start_time;
 #ifdef MLQ_SCHED
-	unsigned long *prio;
+    unsigned long *prio;
 #endif
 } ld_processes;
 int num_processes;
 
-struct cpu_args
-{
-	struct timer_id_t *timer_id;
-	int id;
+struct cpu_args {
+    struct timer_id_t *timer_id;
+    int id;
 };
 
-static void *cpu_routine(void *args)
-{
+// Heap management structures
+typedef struct heap_block {
+    size_t size;
+    int free;
+    struct heap_block *next;
+} heap_block_t;
+
+static heap_block_t *heap_head = NULL;
+static size_t total_heap_size = 0;
+static size_t free_space = 0;
+static const char *heap_stats_file = "output/heap_stats.txt";
+
+void init_heap(size_t size) {
+    heap_head = (heap_block_t *)malloc(size);
+    if (!heap_head) {
+        perror("Failed to initialize heap");
+        exit(1);
+    }
+    heap_head->size = size - sizeof(heap_block_t);
+    heap_head->free = 1;
+    heap_head->next = NULL;
+    total_heap_size = size;
+    free_space = heap_head->size;
+}
+
+void *allocate_memory(size_t size) {
+    heap_block_t *current = heap_head;
+
+    while (current) {
+        if (current->free && current->size >= size) {
+            if (current->size > size + sizeof(heap_block_t)) {
+                heap_block_t *new_block = (heap_block_t *)((char *)current + sizeof(heap_block_t) + size);
+                new_block->size = current->size - size - sizeof(heap_block_t);
+                new_block->free = 1;
+                new_block->next = current->next;
+                current->size = size;
+                current->next = new_block;
+            }
+            current->free = 0;
+            free_space -= size + sizeof(heap_block_t);
+            return (char *)current + sizeof(heap_block_t);
+        }
+        current = current->next;
+    }
+    return NULL;
+}
+
+void free_memory(void *ptr) {
+    if (!ptr) return;
+
+    heap_block_t *block = (heap_block_t *)((char *)ptr - sizeof(heap_block_t));
+    block->free = 1;
+    free_space += block->size + sizeof(heap_block_t);
+
+    heap_block_t *current = heap_head;
+    while (current && current->next) {
+        if (current->free && current->next->free) {
+            current->size += current->next->size + sizeof(heap_block_t);
+            current->next = current->next->next;
+        } else {
+            current = current->next;
+        }
+    }
+}
+
+void save_heap_stats() {
+    FILE *file = fopen(heap_stats_file, "w");
+    if (!file) {
+        perror("Failed to open heap stats file");
+        return;
+    }
+
+    fprintf(file, "Total heap size: %zu\n", total_heap_size);
+    fprintf(file, "Free space: %zu\n", free_space);
+
+    size_t fragmented_blocks = 0;
+    heap_block_t *current = heap_head;
+    while (current) {
+        if (current->free) fragmented_blocks++;
+        current = current->next;
+    }
+    fprintf(file, "Fragmented blocks: %zu\n", fragmented_blocks);
+
+    fclose(file);
+}
+
+static void *cpu_routine(void *args) {
 	int id = ((struct cpu_args *)args)->id;
 	struct timer_id_t *timer_id = ((struct cpu_args *)args)->timer_id;
 
@@ -127,8 +206,7 @@ static void *cpu_routine(void *args)
 	pthread_exit(NULL);
 }
 
-static void *ld_routine(void *args)
-{
+static void *ld_routine(void *args) {
 #ifdef MM_PAGING
 	struct memphy_struct *mram = ((struct mmpaging_ld_args *)args)->mram;
 	struct memphy_struct **mswp = ((struct mmpaging_ld_args *)args)->mswp;
@@ -183,9 +261,8 @@ static void *ld_routine(void *args)
 	pthread_exit(NULL);
 }
 
-static void read_config(const char *path)
-{
-	FILE *file;
+static void read_config(const char *path) {
+    FILE *file;
 	if ((file = fopen(path, "r")) == NULL)
 	{
 		printf("Cannot find configure file at %s\n", path);
@@ -252,28 +329,27 @@ static void read_config(const char *path)
 	}
 }
 
-int main(int argc, char *argv[])
-{
-	/* Read config */
-	if (argc != 2)
-	{
-		printf("Usage: os [path to configure file]\n");
-		return 1;
-	}
-	char path[100];
-	path[0] = '\0';
-	strcat(path, "input/");
-	strcat(path, argv[1]);
-	
-	read_config(path);
+int main(int argc, char *argv[]) {
+    if (argc != 2) {
+        printf("Usage: os [path to configure file]\n");
+        return 1;
+    }
 
-	pthread_t *cpu = (pthread_t *)malloc(num_cpus * sizeof(pthread_t));
-	struct cpu_args *args =
-		(struct cpu_args *)malloc(sizeof(struct cpu_args) * num_cpus);
-	pthread_t ld;
+    char path[100];
+    path[0] = '\0';
+    strcat(path, "input/");
+    strcat(path, argv[1]);
 
-	/* init lock */
-	pthread_mutex_init(&cpu_lock, NULL);
+    read_config(path);
+
+    init_heap(1024 * 1024); // Initialize heap with 1 MB
+
+    pthread_t *cpu = (pthread_t *)malloc(num_cpus * sizeof(pthread_t));
+    struct cpu_args *args = (struct cpu_args *)malloc(sizeof(struct cpu_args) * num_cpus);
+    pthread_t ld;
+
+    pthread_mutex_init(&cpu_lock, NULL);
+    
 	/* Init timer */
 	int i;
 	for (i = 0; i < num_cpus; i++)
@@ -348,6 +424,8 @@ int main(int argc, char *argv[])
 		i++;
 	}
 #endif
-	
-	return 0;
+
+    save_heap_stats(); // Save heap statistics to file before exit
+
+    return 0;
 }
